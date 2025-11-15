@@ -1,0 +1,210 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Website Analytics API",
+    "version": "1.0.0",
+    "description": "This API collects analytics events from websites and mobile applications. It supports API key management, event ingestion and analytics summary endpoints.\n\n**Note:** This implementation uses in‑memory stores for demonstration. In production you should replace the in‑memory store with a persistent database and caching layer."
+  },
+  "paths": {
+    "/api/auth/register": {
+      "post": {
+        "summary": "Register a new app and generate an API key",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": { "type": "string", "description": "App or website name" },
+                  "userEmail": { "type": "string", "format": "email", "description": "Owner email address" }
+                },
+                "required": ["name", "userEmail"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "App registered successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "appId": { "type": "integer" },
+                    "apiKey": { "type": "string" },
+                    "expiresAt": { "type": "string", "format": "date-time" }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "description": "Missing required fields" }
+        }
+      }
+    },
+    "/api/auth/api-key": {
+      "get": {
+        "summary": "Retrieve an API key by app ID",
+        "parameters": [
+          {
+            "name": "appId",
+            "in": "query",
+            "required": true,
+            "schema": { "type": "integer" },
+            "description": "App identifier returned when the app was created"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "API key retrieved",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "apiKey": { "type": "string" }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "description": "Missing appId parameter" },
+          "404": { "description": "App not found" }
+        }
+      }
+    },
+    "/api/auth/revoke": {
+      "post": {
+        "summary": "Revoke an API key",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "apiKey": { "type": "string" }
+                },
+                "required": ["apiKey"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "API key revoked" },
+          "404": { "description": "API key invalid" }
+        }
+      }
+    },
+    "/api/analytics/collect": {
+      "post": {
+        "summary": "Collect an analytics event",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "API key issued to your app"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "event": { "type": "string" },
+                  "url": { "type": "string", "format": "uri" },
+                  "referrer": { "type": "string", "format": "uri" },
+                  "device": { "type": "string" },
+                  "ipAddress": { "type": "string" },
+                  "timestamp": { "type": "string", "format": "date-time" },
+                  "metadata": { "type": "object", "additionalProperties": true },
+                  "userId": { "type": "string" }
+                },
+                "required": ["event"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "Event recorded" },
+          "400": { "description": "Bad request" },
+          "401": { "description": "Invalid or missing API key" },
+          "429": { "description": "Rate limit exceeded" }
+        }
+      }
+    },
+    "/api/analytics/event-summary": {
+      "get": {
+        "summary": "Get aggregated statistics for an event type",
+        "parameters": [
+          { "name": "x-api-key", "in": "header", "required": true, "schema": { "type": "string" } },
+          { "name": "event", "in": "query", "schema": { "type": "string" }, "description": "Event name to summarise" },
+          { "name": "startDate", "in": "query", "schema": { "type": "string", "format": "date" }, "description": "Filter events from this date" },
+          { "name": "endDate", "in": "query", "schema": { "type": "string", "format": "date" }, "description": "Filter events up to this date" },
+          { "name": "app_id", "in": "query", "schema": { "type": "integer" }, "description": "Filter events by a specific app" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Summary returned",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "event": { "type": "string" },
+                    "count": { "type": "integer" },
+                    "uniqueUsers": { "type": "integer" },
+                    "deviceData": {
+                      "type": "object",
+                      "additionalProperties": { "type": "integer" }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "description": "Bad request" },
+          "401": { "description": "Invalid or missing API key" },
+          "429": { "description": "Rate limit exceeded" }
+        }
+      }
+    },
+    "/api/analytics/user-stats": {
+      "get": {
+        "summary": "Get statistics for a specific user",
+        "parameters": [
+          { "name": "x-api-key", "in": "header", "required": true, "schema": { "type": "string" } },
+          { "name": "userId", "in": "query", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "User stats returned",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "userId": { "type": "string" },
+                    "totalEvents": { "type": "integer" },
+                    "deviceDetails": { "type": "object", "additionalProperties": true },
+                    "ipAddress": { "type": "string" }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "description": "Missing userId parameter" },
+          "401": { "description": "Invalid or missing API key" },
+          "404": { "description": "No events found for user" },
+          "429": { "description": "Rate limit exceeded" }
+        }
+      }
+    }
+  }
+}
