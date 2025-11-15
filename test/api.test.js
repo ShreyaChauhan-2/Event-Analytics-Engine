@@ -1,15 +1,26 @@
 // test/api.test.js
-// Tests for the analytics API server using Node's built‑in test runner.
-
 const { test, before, after } = require('node:test');
 const assert = require('node:assert');
-const { createServer } = require('../server');
+const fetch = globalThis.fetch || require('node-fetch'); // ensure fetch exists in Node < 18
+const { createServer, pgClient, initDbPromise } = require('../server');
 
 let server;
 let baseUrl;
 let port;
 
 before(async () => {
+  // Ensure DB init (tables created) finished before starting server
+  if (initDbPromise) {
+    await initDbPromise;
+  } else {
+    // If you don't export initDbPromise, give small delay (not ideal) or modify server per instructions above.
+    await new Promise((r) => setTimeout(r, 200));
+  }
+
+  // Clean DB tables to ensure deterministic tests
+  await pgClient.query('TRUNCATE TABLE events RESTART IDENTITY CASCADE;');
+  await pgClient.query('TRUNCATE TABLE apps RESTART IDENTITY CASCADE;');
+
   // Start the server on an available port before tests
   server = createServer();
   await new Promise((resolve) => {
@@ -21,18 +32,20 @@ before(async () => {
   });
 });
 
-after(() => {
-  if (server) server.close();
+after(async () => {
+  if (server) await new Promise((r) => server.close(r));
+  // close pg client so the node process can exit
+  if (pgClient) await pgClient.end();
 });
 
 async function fetchJson(url, options) {
   const res = await fetch(url, options);
   const text = await res.text();
-  let data;
+  let data = null;
   try {
-    data = JSON.parse(text);
-  } catch {
-    data = null;
+    data = text ? JSON.parse(text) : null;
+  } catch (e) {
+    data = text;
   }
   return { status: res.status, data };
 }
@@ -82,6 +95,7 @@ test('Event collection and event summary', async () => {
     });
     assert.strictEqual(collectRes.status, 201);
   }
+
   // Request summary
   const summaryRes = await fetchJson(`${baseUrl}/api/analytics/event-summary?event=login_form_cta_click`, {
     method: 'GET',
@@ -89,9 +103,9 @@ test('Event collection and event summary', async () => {
   });
   assert.strictEqual(summaryRes.status, 200);
   assert.strictEqual(summaryRes.data.event, 'login_form_cta_click');
-  assert.strictEqual(summaryRes.data.count >= 2, true);
-  assert.strictEqual(summaryRes.data.uniqueUsers >= 2, true);
-  assert.ok(summaryRes.data.deviceData.mobile >= 2);
+  assert.strictEqual(summaryRes.data.count, 2);               // exact because DB was truncated earlier
+  assert.strictEqual(summaryRes.data.uniqueUsers, 2);
+  assert.ok(summaryRes.data.deviceData.mobile === 2);
 });
 
 test('User stats returns correct data', async () => {
@@ -123,7 +137,7 @@ test('User stats returns correct data', async () => {
   });
   assert.strictEqual(statsRes.status, 200);
   assert.strictEqual(statsRes.data.userId, userId);
-  assert.ok(statsRes.data.totalEvents >= 3);
+  assert.strictEqual(statsRes.data.totalEvents, 3);
   assert.strictEqual(statsRes.data.deviceDetails.browser, 'Firefox');
   assert.strictEqual(statsRes.data.deviceDetails.os, 'Linux');
   assert.strictEqual(statsRes.data.ipAddress, '10.0.0.1');

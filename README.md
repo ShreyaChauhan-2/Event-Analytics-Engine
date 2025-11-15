@@ -34,7 +34,7 @@ Clone or download this repository and then run the following commands from the p
 ## Run the server directly
 npm start
 
-## The server listens on port 3000 by default
+## The server listens on port 3002 by default
 ```
 
 ### Using Docker
@@ -43,7 +43,7 @@ To build and run the service in a container:
 
 ```bash
 docker build -t analytics-api .
-docker run -p 3000:3000 analytics-api
+docker run -p 8375:3000 analytics-api
 ```
 
 ### Running Tests

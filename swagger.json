@@ -5,6 +5,12 @@
     "version": "1.0.0",
     "description": "This API collects analytics events from websites and mobile applications. It supports API key management, event ingestion and analytics summary endpoints.\n\n**Note:** This implementation uses in‑memory stores for demonstration. In production you should replace the in‑memory store with a persistent database and caching layer."
   },
+  "servers": [
+    {
+      "url": "http://localhost:3002",
+      "description": "Local development server"
+    }
+  ],
   "paths": {
     "/api/auth/register": {
       "post": {
