@@ -1,4 +1,4 @@
-# Website Analytics API
+# Event-Analytics-Engine API
 
 This project implements a **simple yet extensible backend API** for collecting analytics events from websites and mobile applications.
 It provides endpoints for:
@@ -99,8 +99,7 @@ Client → Backend → PostgreSQL (Stores events)
 ## 1 Clone the Repository
 
 ```bash
-git clone <repository-url>
-cd analytics-api
+git clone https://github.com/ShreyaChauhan-2/Event-Analytics-Engine
 ```
 
 ## 2 Install Dependencies
@@ -137,7 +136,7 @@ OAUTH_CALLBACK_URL=http://localhost:3002/auth/google/callback
 
 ---
 
-# Running with Docker (Recommended)
+# Running with Docker
 
 Start all services:
 
@@ -321,5 +320,5 @@ Returns:
 
 # Conclusion
 
-This repository demonstrates API key management, OAuth onboarding, Event ingestion, Aggregation & caching, Rate limiting, Persistence with PostgreSQL, Redis caching + sessions, Production-grade architecture.
+This repository demonstrates API key management, OAuth onboarding, Event ingestion, Aggregation & cssaching, Rate limiting, Persistence with PostgreSQL, Redis caching + sessions, Production-grade architecture.
 
