@@ -2,24 +2,40 @@
 const { test, before, after } = require('node:test');
 const assert = require('node:assert');
 const fetch = globalThis.fetch || require('node-fetch'); // ensure fetch exists in Node < 18
-const { createServer, pgClient, initDbPromise } = require('../server');
+
+const {
+  createServer,
+  pgClient,
+  initDbPromise,
+  redisClient,
+  initRedisPromise,
+} = require('../server');
 
 let server;
 let baseUrl;
 let port;
 
 before(async () => {
-  // Ensure DB init (tables created) finished before starting server
+  // Wait for DB and Redis initialization
   if (initDbPromise) {
     await initDbPromise;
   } else {
-    // If you don't export initDbPromise, give small delay (not ideal) or modify server per instructions above.
     await new Promise((r) => setTimeout(r, 200));
+  }
+  if (initRedisPromise) {
+    await initRedisPromise;
+  } else {
+    await new Promise((r) => setTimeout(r, 50));
   }
 
   // Clean DB tables to ensure deterministic tests
-  await pgClient.query('TRUNCATE TABLE events RESTART IDENTITY CASCADE;');
-  await pgClient.query('TRUNCATE TABLE apps RESTART IDENTITY CASCADE;');
+  // Truncate users first if FK constraints exist, or use CASCADE
+  await pgClient.query('TRUNCATE TABLE events, apps, users RESTART IDENTITY CASCADE;');
+
+  // Flush Redis (clear cached summaries and token buckets)
+  if (redisClient && typeof redisClient.flushdb === 'function') {
+    await redisClient.flushdb();
+  }
 
   // Start the server on an available port before tests
   server = createServer();
@@ -36,6 +52,14 @@ after(async () => {
   if (server) await new Promise((r) => server.close(r));
   // close pg client so the node process can exit
   if (pgClient) await pgClient.end();
+  // close redis client
+  if (redisClient && typeof redisClient.quit === 'function') {
+    try {
+      await redisClient.quit();
+    } catch (e) {
+      // ignore errors on shutdown
+    }
+  }
 });
 
 async function fetchJson(url, options) {

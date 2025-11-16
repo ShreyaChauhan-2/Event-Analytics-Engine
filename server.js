@@ -1,32 +1,50 @@
 // server.js
-// Analytics backend with persistence to PostgreSQL for apps and events.
-// Exports `createServer`, `pgClient`, and `initDbPromise` so tests can await DB readiness.
+// Express-based analytics backend with PostgreSQL, Redis caching, Redis token-bucket rate limiting,
+// and Google OAuth onboarding (Passport).
+//
+// Exports: app, createServer, pgClient, initDbPromise, redisClient, initRedisPromise
 
 require('dotenv').config();
+const express = require('express');
 const http = require('http');
 const crypto = require('crypto');
-const { URL } = require('url');
 const { Client } = require('pg');
+const Redis = require('ioredis');
+const fs = require('fs');
+const path = require('path');
+const passport = require('passport');
+const GoogleStrategy = require('passport-google-oauth20').Strategy;
+const session = require('express-session');
+const connectRedis = require('connect-redis');
 
-// Postgres client configuration (use env vars or sensible defaults)
+// -------------------------
+// Postgres setup
+// -------------------------
 const pgClient = new Client({
   host: process.env.PG_HOST || 'localhost',
   user: process.env.PG_USER || 'postgres',
   port: process.env.PG_PORT ? parseInt(process.env.PG_PORT, 10) : 5432,
   password: process.env.PG_PASSWORD || '',
   database: process.env.PG_DATABASE || 'dbanalytics',
-  // optional: ssl: { rejectUnauthorized: false } if needed
 });
 
-// -------------------------
-// initDbPromise — exported so tests can await DB setup
-// -------------------------
 let initDbPromise = (async () => {
   try {
     await pgClient.connect();
     console.log('db successfully connected');
 
-    // Ensure tables exist (safe to run on start; simple migration)
+    // Ensure tables exist
+    await pgClient.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        google_id TEXT UNIQUE,
+        email TEXT,
+        display_name TEXT,
+        avatar_url TEXT,
+        created_at TIMESTAMPTZ DEFAULT now()
+      );
+    `);
+
     await pgClient.query(`
       CREATE TABLE IF NOT EXISTS apps (
         id SERIAL PRIMARY KEY,
@@ -36,6 +54,7 @@ let initDbPromise = (async () => {
         revoked BOOLEAN DEFAULT FALSE,
         expires_at TIMESTAMPTZ NOT NULL,
         revoked_at TIMESTAMPTZ,
+        user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
         created_at TIMESTAMPTZ DEFAULT now()
       );
     `);
@@ -61,73 +80,154 @@ let initDbPromise = (async () => {
   }
 })();
 
-// In-memory stores for cache and rate limiting
-const cache = {};
-const rateLimits = {};
+// -------------------------
+// Redis setup
+// -------------------------
+const redisHost = process.env.REDIS_HOST || '127.0.0.1';
+const redisPort = process.env.REDIS_PORT ? parseInt(process.env.REDIS_PORT, 10) : 6379;
+const redisUrl = process.env.REDIS_URL || null;
+const redisOpts = redisUrl ? { url: redisUrl } : { host: redisHost, port: redisPort };
 
-// Configuration
-const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minute window
-const EVENT_LIMIT_PER_WINDOW = 100;     // allow 100 events per IP per minute
-const ANALYTICS_LIMIT_PER_WINDOW = 60;  // allow 60 analytics requests per IP per minute
-const CACHE_TTL_MS = 2 * 60 * 1000; // cache analytics summary for 2 minutes
+const redisClient = new Redis(redisOpts);
+const RedisStore = connectRedis(session);
 
-// Helper: generate a random API key
+// Token-bucket Lua script (atomic)
+const tokenBucketLua = `
+-- KEYS[1] = bucket key
+-- ARGV[1] = capacity
+-- ARGV[2] = window_ms
+-- ARGV[3] = tokens_to_consume
+local capacity = tonumber(ARGV[1])
+local window_ms = tonumber(ARGV[2])
+local consume = tonumber(ARGV[3])
+local t = redis.call('TIME')
+local now_ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+local data = redis.call('HMGET', KEYS[1], 'tokens', 'last_refill')
+local tokens = tonumber(data[1]) or capacity
+local last_refill = tonumber(data[2]) or now_ms
+local elapsed = now_ms - last_refill
+if elapsed < 0 then elapsed = 0 end
+local refill_rate = capacity / window_ms
+local refill = elapsed * refill_rate
+tokens = math.min(capacity, tokens + refill)
+if tokens >= consume then
+  tokens = tokens - consume
+  redis.call('HMSET', KEYS[1], 'tokens', tostring(tokens), 'last_refill', tostring(now_ms))
+  redis.call('PEXPIRE', KEYS[1], math.max(60000, window_ms * 5))
+  return {1, math.floor(tokens)}
+else
+  local needed = consume - tokens
+  local ms_until = math.ceil(needed / refill_rate)
+  return {0, math.floor(tokens), ms_until}
+end
+`;
+
+let tokenBucketScriptSha = null;
+let initRedisPromise = (async () => {
+  try {
+    await redisClient.ping();
+    tokenBucketScriptSha = await redisClient.script('LOAD', tokenBucketLua);
+    console.log('Redis connected and token-bucket script loaded:', tokenBucketScriptSha);
+  } catch (err) {
+    console.error('Redis init failed (cache & distributed rate-limiting disabled):', err.message || err);
+    tokenBucketScriptSha = null;
+  }
+})();
+
+// -------------------------
+// Config
+// -------------------------
+const EVENT_BUCKET_CAPACITY = parseInt(process.env.EVENT_BUCKET_CAPACITY || '100', 10);
+const EVENT_BUCKET_WINDOW_MS = parseInt(process.env.EVENT_BUCKET_WINDOW_MS || '60000', 10);
+const ANALYTICS_BUCKET_CAPACITY = parseInt(process.env.ANALYTICS_BUCKET_CAPACITY || '60', 10);
+const ANALYTICS_BUCKET_WINDOW_MS = parseInt(process.env.ANALYTICS_BUCKET_WINDOW_MS || '60000', 10);
+const CACHE_TTL_MS = parseInt(process.env.CACHE_TTL_MS || String(2 * 60 * 1000), 10);
+
+// Fallback in-memory cache & token-bucket (single-node)
+const fallbackCache = {};
+const tbFallback = {};
+
+// -------------------------
+// Helpers
+// -------------------------
 function generateApiKey() {
   return crypto.randomBytes(16).toString('hex');
 }
 
-// Helper: parse JSON body from request
-function parseRequestBody(req) {
-  return new Promise((resolve, reject) => {
-    let body = '';
-    req.on('data', chunk => {
-      body += chunk;
-      // Prevent large bodies
-      if (body.length > 1e6) {
-        req.connection.destroy();
-        reject(new Error('Payload too large'));
-      }
-    });
-    req.on('end', () => {
-      if (!body) {
-        resolve({});
-        return;
-      }
-      try {
-        const json = JSON.parse(body);
-        resolve(json);
-      } catch (err) {
-        reject(new Error('Invalid JSON'));
-      }
-    });
-  });
-}
-
-// Helper: send JSON response
-function sendJson(res, statusCode, data) {
-  const body = JSON.stringify(data);
-  res.writeHead(statusCode, {
-    'Content-Type': 'application/json',
-    'Content-Length': Buffer.byteLength(body),
-  });
-  res.end(body);
-}
-
-// Middleware: rate limiter
-function checkRateLimit(ip, limit) {
-  const now = Date.now();
-  const info = rateLimits[ip] || { count: 0, windowStart: now };
-  // Reset window if expired
-  if (now - info.windowStart > RATE_LIMIT_WINDOW_MS) {
-    info.count = 0;
-    info.windowStart = now;
+async function redisGetJson(key) {
+  try {
+    const v = await redisClient.get(key);
+    return v ? JSON.parse(v) : null;
+  } catch (err) {
+    const fb = fallbackCache[key];
+    if (fb && fb.expiry > Date.now()) return fb.value;
+    return null;
   }
-  info.count += 1;
-  rateLimits[ip] = info;
-  return info.count <= limit;
 }
 
+async function redisSetJson(key, value, ttlMs) {
+  try {
+    await redisClient.set(key, JSON.stringify(value), 'PX', ttlMs);
+  } catch (err) {
+    fallbackCache[key] = { value, expiry: Date.now() + ttlMs };
+  }
+}
+
+function tbKeyForIp(ip) {
+  return `tb:ip:${ip}`;
+}
+function tbKeyForApiKey(apiKey) {
+  return `tb:key:${apiKey}`;
+}
+
+function consumeTokenBucketFallback(key, capacity, windowMs, tokensToConsume = 1) {
+  const now = Date.now();
+  const bucket = tbFallback[key] || { tokens: capacity, lastRefillMs: now };
+  const refillRate = capacity / windowMs;
+  const elapsed = now - bucket.lastRefillMs;
+  const refill = elapsed * refillRate;
+  let tokens = Math.min(capacity, bucket.tokens + refill);
+  if (tokens >= tokensToConsume) {
+    tokens -= tokensToConsume;
+    tbFallback[key] = { tokens, lastRefillMs: now };
+    return { ok: true, remaining: Math.floor(tokens), retryAfterMs: 0, limit: capacity };
+  } else {
+    const needed = tokensToConsume - tokens;
+    const msUntil = Math.ceil(needed / refillRate);
+    tbFallback[key] = { tokens, lastRefillMs: bucket.lastRefillMs };
+    return { ok: false, remaining: Math.floor(tokens), retryAfterMs: msUntil, limit: capacity };
+  }
+}
+
+async function consumeTokenBucketRedis(key, capacity, windowMs, tokensToConsume = 1) {
+  if (!tokenBucketScriptSha) {
+    // Attempt to reload
+    try {
+      tokenBucketScriptSha = await redisClient.script('LOAD', tokenBucketLua);
+    } catch (err) {
+      return consumeTokenBucketFallback(key, capacity, windowMs, tokensToConsume);
+    }
+  }
+  try {
+    const res = await redisClient.evalsha(tokenBucketScriptSha, 1, key, String(capacity), String(windowMs), String(tokensToConsume));
+    if (!res) return { ok: false, remaining: 0, retryAfterMs: windowMs, limit: capacity };
+    if (Number(res[0]) === 1) return { ok: true, remaining: Number(res[1]), retryAfterMs: 0, limit: capacity };
+    return { ok: false, remaining: Number(res[1]), retryAfterMs: Number(res[2]), limit: capacity };
+  } catch (err) {
+    try {
+      tokenBucketScriptSha = await redisClient.script('LOAD', tokenBucketLua);
+      const res2 = await redisClient.evalsha(tokenBucketScriptSha, 1, key, String(capacity), String(windowMs), String(tokensToConsume));
+      if (Number(res2[0]) === 1) return { ok: true, remaining: Number(res2[1]), retryAfterMs: 0, limit: capacity };
+      return { ok: false, remaining: Number(res2[1]), retryAfterMs: Number(res2[2]), limit: capacity };
+    } catch (err2) {
+      return consumeTokenBucketFallback(key, capacity, windowMs, tokensToConsume);
+    }
+  }
+}
+
+// -------------------------
 // DB helpers
+// -------------------------
 async function getAppByApiKey(apiKey) {
   if (!apiKey) return null;
   const q = 'SELECT * FROM apps WHERE api_key = $1 LIMIT 1';
@@ -141,17 +241,128 @@ async function getAppById(id) {
   return r.rows[0] || null;
 }
 
-// Route handlers
-async function handleRegister(req, res) {
+// -------------------------
+// Express app + middlewares
+// -------------------------
+const app = express();
+app.use(express.json());
+
+// Session store (Redis-backed)
+const sessionMiddleware = session({
+  store: new RedisStore({ client: redisClient, prefix: 'sess:' }),
+  secret: process.env.SESSION_SECRET || 'change_this_session_secret',
+  resave: false,
+  saveUninitialized: false,
+  cookie: { secure: false, httpOnly: true }, // set secure: true behind TLS
+});
+app.use(sessionMiddleware);
+
+// Passport Google OAuth
+passport.use(new GoogleStrategy({
+  clientID: process.env.GOOGLE_CLIENT_ID || '',
+  clientSecret: process.env.GOOGLE_CLIENT_SECRET || '',
+  callbackURL: process.env.OAUTH_CALLBACK_URL || 'http://localhost:3002/auth/google/callback',
+}, async (accessToken, refreshToken, profile, done) => {
   try {
-    const body = await parseRequestBody(req);
-    const { name, userEmail } = body;
+    const googleId = profile.id;
+    const email = profile.emails && profile.emails[0] && profile.emails[0].value;
+    const displayName = profile.displayName || null;
+    const avatar = profile.photos && profile.photos[0] && profile.photos[0].value;
+
+    const upsertQ = `
+      INSERT INTO users (google_id, email, display_name, avatar_url)
+      VALUES ($1, $2, $3, $4)
+      ON CONFLICT (google_id) DO UPDATE
+        SET email = EXCLUDED.email,
+            display_name = EXCLUDED.display_name,
+            avatar_url = EXCLUDED.avatar_url
+      RETURNING *;
+    `;
+    const r = await pgClient.query(upsertQ, [googleId, email, displayName, avatar]);
+    const user = r.rows[0];
+    return done(null, user);
+  } catch (err) {
+    return done(err);
+  }
+}));
+
+passport.serializeUser((user, done) => {
+  done(null, user.id);
+});
+passport.deserializeUser(async (id, done) => {
+  try {
+    const r = await pgClient.query('SELECT * FROM users WHERE id = $1', [id]);
+    done(null, r.rows[0] || null);
+  } catch (err) {
+    done(err);
+  }
+});
+
+app.use(passport.initialize());
+app.use(passport.session());
+
+// Helper middleware to adapt legacy handlers' response format
+function sendJsonExpress(res, statusCode, data) {
+  res.status(statusCode).json(data);
+}
+
+// -------------------------
+// Routes (Auth + OAuth)
+// -------------------------
+app.get('/auth/google', passport.authenticate('google', { scope: ['profile', 'email'] }));
+
+app.get('/auth/google/callback',
+  passport.authenticate('google', { failureRedirect: '/auth/failure' }),
+  (req, res) => {
+    // On success, redirect to a simple page or return JSON.
+    // For simplicity return JSON if X-Requested-With present, else redirect to /docs or dashboard.
+    if (req.headers['accept'] && req.headers['accept'].includes('application/json')) {
+      res.json({ message: 'Authentication successful', user: req.user });
+    } else {
+      res.redirect('/docs'); // or /dashboard in your frontend
+    }
+  }
+);
+
+app.get('/auth/failure', (req, res) => {
+  res.status(401).send('Authentication failed');
+});
+
+function ensureLoggedIn(req, res, next) {
+  if (req.isAuthenticated && req.isAuthenticated()) return next();
+  res.status(401).json({ error: 'Unauthorized' });
+}
+
+// Protected route - register app for authenticated user
+app.post('/api/auth/register-for-user', ensureLoggedIn, async (req, res) => {
+  try {
+    const { name } = req.body;
+    if (!name) return sendJsonExpress(res, 400, { error: 'Missing name' });
+    const apiKey = generateApiKey();
+    const expiresAt = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000);
+    const q = `INSERT INTO apps (name, user_email, api_key, expires_at, user_id) VALUES ($1,$2,$3,$4,$5) RETURNING id, api_key, expires_at;`;
+    const r = await pgClient.query(q, [name, req.user.email || null, apiKey, expiresAt.toISOString(), req.user.id]);
+    return sendJsonExpress(res, 201, r.rows[0]);
+  } catch (err) {
+    console.error('register-for-user error:', err);
+    return sendJsonExpress(res, 500, { error: err.message });
+  }
+});
+
+// -------------------------
+// REST endpoints (analytics & api key management)
+// These implement the same behavior as the previous server.js
+// -------------------------
+
+// POST /api/auth/register (public register)
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { name, userEmail } = req.body || {};
     if (!name || !userEmail) {
-      return sendJson(res, 400, { error: 'Missing required fields: name and userEmail' });
+      return sendJsonExpress(res, 400, { error: 'Missing required fields: name and userEmail' });
     }
     const apiKey = generateApiKey();
-    const expiresAt = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000); // 1 year expiry
-
+    const expiresAt = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000);
     const insertQ = `
       INSERT INTO apps (name, user_email, api_key, expires_at)
       VALUES ($1, $2, $3, $4)
@@ -159,70 +370,94 @@ async function handleRegister(req, res) {
     `;
     const r = await pgClient.query(insertQ, [name, userEmail, apiKey, expiresAt.toISOString()]);
     const row = r.rows[0];
-    return sendJson(res, 201, { appId: row.id, apiKey: row.api_key, expiresAt: row.expires_at });
+    return sendJsonExpress(res, 201, { appId: row.id, apiKey: row.api_key, expiresAt: row.expires_at });
   } catch (err) {
     console.error('handleRegister error:', err);
-    return sendJson(res, 400, { error: err.message });
+    return sendJsonExpress(res, 400, { error: err.message });
   }
-}
+});
 
-async function handleGetApiKey(req, res, url) {
+// GET /api/auth/api-key?appId=...
+app.get('/api/auth/api-key', async (req, res) => {
   try {
-    const params = url.searchParams;
-    const appIdParam = params.get('appId');
+    const appIdParam = req.query.appId;
     if (!appIdParam) {
-      return sendJson(res, 400, { error: 'Missing appId parameter' });
+      return sendJsonExpress(res, 400, { error: 'Missing appId parameter' });
     }
     const appId = parseInt(appIdParam, 10);
-    const app = await getAppById(appId);
-    if (!app) {
-      return sendJson(res, 404, { error: 'App not found' });
-    }
-    return sendJson(res, 200, { apiKey: app.api_key });
+    const appRow = await getAppById(appId);
+    if (!appRow) return sendJsonExpress(res, 404, { error: 'App not found' });
+    return sendJsonExpress(res, 200, { apiKey: appRow.api_key });
   } catch (err) {
-    return sendJson(res, 500, { error: err.message });
+    return sendJsonExpress(res, 500, { error: err.message });
   }
-}
+});
 
-async function handleRevoke(req, res) {
+// POST /api/auth/revoke
+app.post('/api/auth/revoke', async (req, res) => {
   try {
-    const body = await parseRequestBody(req);
-    const apiKey = body.apiKey || req.headers['x-api-key'];
-    if (!apiKey) {
-      return sendJson(res, 400, { error: 'Missing apiKey' });
-    }
-    const app = await getAppByApiKey(apiKey);
-    if (!app) {
-      return sendJson(res, 404, { error: 'Invalid API key' });
-    }
-    const now = new Date();
-    await pgClient.query('UPDATE apps SET revoked = true, revoked_at = $1 WHERE id = $2', [now.toISOString(), app.id]);
-    return sendJson(res, 200, { message: 'API key revoked' });
+    const apiKey = (req.body && req.body.apiKey) || req.headers['x-api-key'] || req.headers['X-API-KEY'];
+    if (!apiKey) return sendJsonExpress(res, 400, { error: 'Missing apiKey' });
+    const appRow = await getAppByApiKey(apiKey);
+    if (!appRow) return sendJsonExpress(res, 404, { error: 'Invalid API key' });
+    await pgClient.query('UPDATE apps SET revoked = true, revoked_at = $1 WHERE id = $2', [new Date().toISOString(), appRow.id]);
+    return sendJsonExpress(res, 200, { message: 'API key revoked' });
   } catch (err) {
     console.error('handleRevoke error:', err);
-    return sendJson(res, 400, { error: err.message });
+    return sendJsonExpress(res, 400, { error: err.message });
   }
+});
+
+// Helper: check API key validity and return app or null
+async function requireValidApp(apiKey) {
+  if (!apiKey) return null;
+  const appRow = await getAppByApiKey(apiKey);
+  if (!appRow) return null;
+  if (appRow.revoked) return null;
+  if (new Date() > new Date(appRow.expires_at)) return null;
+  return appRow;
 }
 
-async function handleCollect(req, res, ip) {
-  // Rate limit event submissions
-  if (!checkRateLimit(ip, EVENT_LIMIT_PER_WINDOW)) {
-    return sendJson(res, 429, { error: 'Rate limit exceeded' });
+// POST /api/analytics/collect
+app.post('/api/analytics/collect', async (req, res) => {
+  const ip = req.ip || req.socket.remoteAddress || 'unknown';
+  const apiKey = req.headers['x-api-key'] || req.headers['X-API-KEY'] || null;
+
+  // IP token bucket
+  const ipKey = tbKeyForIp(ip);
+  const ipRes = (tokenBucketScriptSha ? await consumeTokenBucketRedis(ipKey, EVENT_BUCKET_CAPACITY, EVENT_BUCKET_WINDOW_MS, 1) : consumeTokenBucketFallback(ipKey, EVENT_BUCKET_CAPACITY, EVENT_BUCKET_WINDOW_MS, 1));
+  if (!ipRes.ok) {
+    res.setHeader('Retry-After', String(Math.ceil(ipRes.retryAfterMs / 1000)));
+    res.setHeader('X-RateLimit-Limit', String(ipRes.limit));
+    res.setHeader('X-RateLimit-Remaining', String(ipRes.remaining));
+    return sendJsonExpress(res, 429, { error: 'Rate limit exceeded (ip)', retryAfter: Math.ceil(ipRes.retryAfterMs / 1000) });
   }
-  const apiKey = req.headers['x-api-key'] || req.headers['X-API-KEY'];
-  if (!apiKey) {
-    return sendJson(res, 401, { error: 'Missing API key' });
-  }
-  const app = await getAppByApiKey(apiKey);
-  if (!app || app.revoked || new Date() > new Date(app.expires_at)) {
-    return sendJson(res, 401, { error: 'Invalid or expired API key' });
-  }
-  try {
-    const body = await parseRequestBody(req);
-    const { event, url, referrer, device, ipAddress, timestamp, metadata, userId } = body;
-    if (!event) {
-      return sendJson(res, 400, { error: 'Missing event type' });
+
+  // API-key token bucket
+  if (apiKey) {
+    const keyKey = tbKeyForApiKey(apiKey);
+    const keyRes = (tokenBucketScriptSha ? await consumeTokenBucketRedis(keyKey, EVENT_BUCKET_CAPACITY, EVENT_BUCKET_WINDOW_MS, 1) : consumeTokenBucketFallback(keyKey, EVENT_BUCKET_CAPACITY, EVENT_BUCKET_WINDOW_MS, 1));
+    if (!keyRes.ok) {
+      res.setHeader('Retry-After', String(Math.ceil(keyRes.retryAfterMs / 1000)));
+      res.setHeader('X-RateLimit-Limit', String(keyRes.limit));
+      res.setHeader('X-RateLimit-Remaining', String(keyRes.remaining));
+      return sendJsonExpress(res, 429, { error: 'Rate limit exceeded (api key)', retryAfter: Math.ceil(keyRes.retryAfterMs / 1000) });
     }
+    res.setHeader('X-RateLimit-Limit', String(keyRes.limit));
+    res.setHeader('X-RateLimit-Remaining', String(keyRes.remaining));
+  } else {
+    res.setHeader('X-RateLimit-Limit', String(ipRes.limit));
+    res.setHeader('X-RateLimit-Remaining', String(ipRes.remaining));
+  }
+
+  if (!apiKey) return sendJsonExpress(res, 401, { error: 'Missing API key' });
+
+  const appRow = await requireValidApp(apiKey);
+  if (!appRow) return sendJsonExpress(res, 401, { error: 'Invalid or expired API key' });
+
+  try {
+    const { event, url, referrer, device, ipAddress, timestamp, metadata, userId } = req.body || {};
+    if (!event) return sendJsonExpress(res, 400, { error: 'Missing event type' });
     const eventTime = timestamp ? new Date(timestamp) : new Date();
     const insertQ = `
       INSERT INTO events
@@ -232,7 +467,7 @@ async function handleCollect(req, res, ip) {
       RETURNING id;
     `;
     const params = [
-      app.id,
+      appRow.id,
       event,
       url || null,
       referrer || null,
@@ -244,60 +479,81 @@ async function handleCollect(req, res, ip) {
     ];
     await pgClient.query(insertQ, params);
 
-    // Invalidate cached summaries that might be affected
-    Object.keys(cache).forEach(key => {
-      if (key.startsWith('eventSummary:')) {
-        delete cache[key];
-      }
-    });
-
-    return sendJson(res, 201, { message: 'Event recorded' });
-  } catch (err) {
-    console.error('handleCollect error:', err);
-    return sendJson(res, 400, { error: err.message });
-  }
-}
-
-async function handleEventSummary(req, res, url, ip) {
-  // Rate limit analytics requests
-  if (!checkRateLimit(ip, ANALYTICS_LIMIT_PER_WINDOW)) {
-    return sendJson(res, 429, { error: 'Rate limit exceeded' });
-  }
-  const apiKey = req.headers['x-api-key'] || req.headers['X-API-KEY'];
-  if (!apiKey) {
-    return sendJson(res, 401, { error: 'Missing API key' });
-  }
-  const app = await getAppByApiKey(apiKey);
-  if (!app || app.revoked || new Date() > new Date(app.expires_at)) {
-    return sendJson(res, 401, { error: 'Invalid or expired API key' });
-  }
-
-  try {
-    const params = url.searchParams;
-    const eventType = params.get('event');
-    const startDateStr = params.get('startDate');
-    const endDateStr = params.get('endDate');
-    const appIdParam = params.get('app_id');
-
-    // Compose cache key
-    const cacheKey = `eventSummary:${apiKey}:${eventType || 'all'}:${startDateStr || 'null'}:${endDateStr || 'null'}:${appIdParam || 'all'}`;
-    const cached = cache[cacheKey];
-    if (cached && cached.expiry > Date.now()) {
-      return sendJson(res, 200, cached.value);
+    // Invalidate matching Redis cache keys
+    try {
+      const stream = redisClient.scanStream({ match: 'eventSummary:*', count: 100 });
+      stream.on('data', (keys) => {
+        if (keys.length) redisClient.del(...keys).catch(() => {});
+      });
+    } catch (err) {
+      // ignore
     }
 
-    // Build dynamic where clauses
+    return sendJsonExpress(res, 201, { message: 'Event recorded' });
+  } catch (err) {
+    console.error('handleCollect error:', err);
+    return sendJsonExpress(res, 400, { error: err.message });
+  }
+});
+
+// GET /api/analytics/event-summary
+app.get('/api/analytics/event-summary', async (req, res) => {
+  const ip = req.ip || req.socket.remoteAddress || 'unknown';
+  const apiKey = req.headers['x-api-key'] || req.headers['X-API-KEY'] || null;
+
+  const ipKey = tbKeyForIp(ip);
+  const ipRes = (tokenBucketScriptSha ? await consumeTokenBucketRedis(ipKey, ANALYTICS_BUCKET_CAPACITY, ANALYTICS_BUCKET_WINDOW_MS, 1) : consumeTokenBucketFallback(ipKey, ANALYTICS_BUCKET_CAPACITY, ANALYTICS_BUCKET_WINDOW_MS, 1));
+  if (!ipRes.ok) {
+    res.setHeader('Retry-After', String(Math.ceil(ipRes.retryAfterMs / 1000)));
+    res.setHeader('X-RateLimit-Limit', String(ipRes.limit));
+    res.setHeader('X-RateLimit-Remaining', String(ipRes.remaining));
+    return sendJsonExpress(res, 429, { error: 'Rate limit exceeded (ip)', retryAfter: Math.ceil(ipRes.retryAfterMs / 1000) });
+  }
+
+  if (apiKey) {
+    const keyKey = tbKeyForApiKey(apiKey);
+    const keyRes = (tokenBucketScriptSha ? await consumeTokenBucketRedis(keyKey, ANALYTICS_BUCKET_CAPACITY, ANALYTICS_BUCKET_WINDOW_MS, 1) : consumeTokenBucketFallback(keyKey, ANALYTICS_BUCKET_CAPACITY, ANALYTICS_BUCKET_WINDOW_MS, 1));
+    if (!keyRes.ok) {
+      res.setHeader('Retry-After', String(Math.ceil(keyRes.retryAfterMs / 1000)));
+      res.setHeader('X-RateLimit-Limit', String(keyRes.limit));
+      res.setHeader('X-RateLimit-Remaining', String(keyRes.remaining));
+      return sendJsonExpress(res, 429, { error: 'Rate limit exceeded (api key)', retryAfter: Math.ceil(keyRes.retryAfterMs / 1000) });
+    }
+    res.setHeader('X-RateLimit-Limit', String(keyRes.limit));
+    res.setHeader('X-RateLimit-Remaining', String(keyRes.remaining));
+  } else {
+    res.setHeader('X-RateLimit-Limit', String(ipRes.limit));
+    res.setHeader('X-RateLimit-Remaining', String(ipRes.remaining));
+  }
+
+  if (!apiKey) return sendJsonExpress(res, 401, { error: 'Missing API key' });
+
+  const appRow = await requireValidApp(apiKey);
+  if (!appRow) return sendJsonExpress(res, 401, { error: 'Invalid or expired API key' });
+
+  try {
+    const eventType = req.query.event || null;
+    const startDateStr = req.query.startDate || null;
+    const endDateStr = req.query.endDate || null;
+    const appIdParam = req.query.app_id || null;
+
+    const cacheKey = `eventSummary:${apiKey}:${eventType || 'all'}:${startDateStr || 'null'}:${endDateStr || 'null'}:${appIdParam || 'all'}`;
+    const cached = await redisGetJson(cacheKey);
+    if (cached) {
+      res.setHeader('X-Cache', 'HIT');
+      return sendJsonExpress(res, 200, cached);
+    }
+
     const where = [];
     const values = [];
     let idx = 1;
 
-    // Only include events that belong to the requested app (or app_id param)
     if (appIdParam) {
       where.push(`app_id = $${idx++}`);
       values.push(parseInt(appIdParam, 10));
     } else {
       where.push(`app_id = $${idx++}`);
-      values.push(app.id);
+      values.push(appRow.id);
     }
 
     if (eventType) {
@@ -315,17 +571,14 @@ async function handleEventSummary(req, res, url, ip) {
 
     const whereClause = where.length ? `WHERE ${where.join(' AND ')}` : '';
 
-    // Total count
     const countQ = `SELECT COUNT(*)::int AS cnt FROM events ${whereClause};`;
     const countRes = await pgClient.query(countQ, values);
     const count = (countRes.rows[0] && countRes.rows[0].cnt) || 0;
 
-    // Unique users: distinct coalesce(user_id, ip_address)
     const uniqueQ = `SELECT COUNT(DISTINCT COALESCE(user_id, ip_address))::int AS unique_count FROM events ${whereClause};`;
     const uniqueRes = await pgClient.query(uniqueQ, values);
     const uniqueUsers = (uniqueRes.rows[0] && uniqueRes.rows[0].unique_count) || 0;
 
-    // Device counts
     const deviceQ = `SELECT device, COUNT(*)::int AS cnt FROM events ${whereClause} GROUP BY device ORDER BY cnt DESC;`;
     const deviceRes = await pgClient.query(deviceQ, values);
     const deviceCounts = {};
@@ -340,35 +593,53 @@ async function handleEventSummary(req, res, url, ip) {
       deviceData: deviceCounts,
     };
 
-    // Cache result
-    cache[cacheKey] = { value: result, expiry: Date.now() + CACHE_TTL_MS };
-
-    return sendJson(res, 200, result);
+    await redisSetJson(cacheKey, result, CACHE_TTL_MS);
+    res.setHeader('X-Cache', 'MISS');
+    return sendJsonExpress(res, 200, result);
   } catch (err) {
     console.error('handleEventSummary error:', err);
-    return sendJson(res, 500, { error: err.message });
+    return sendJsonExpress(res, 500, { error: err.message });
   }
-}
+});
 
-async function handleUserStats(req, res, url, ip) {
-  // Rate limit analytics requests
-  if (!checkRateLimit(ip, ANALYTICS_LIMIT_PER_WINDOW)) {
-    return sendJson(res, 429, { error: 'Rate limit exceeded' });
+// GET /api/analytics/user-stats?userId=...
+app.get('/api/analytics/user-stats', async (req, res) => {
+  const ip = req.ip || req.socket.remoteAddress || 'unknown';
+  const apiKey = req.headers['x-api-key'] || req.headers['X-API-KEY'] || null;
+
+  const ipKey = tbKeyForIp(ip);
+  const ipRes = (tokenBucketScriptSha ? await consumeTokenBucketRedis(ipKey, ANALYTICS_BUCKET_CAPACITY, ANALYTICS_BUCKET_WINDOW_MS, 1) : consumeTokenBucketFallback(ipKey, ANALYTICS_BUCKET_CAPACITY, ANALYTICS_BUCKET_WINDOW_MS, 1));
+  if (!ipRes.ok) {
+    res.setHeader('Retry-After', String(Math.ceil(ipRes.retryAfterMs / 1000)));
+    res.setHeader('X-RateLimit-Limit', String(ipRes.limit));
+    res.setHeader('X-RateLimit-Remaining', String(ipRes.remaining));
+    return sendJsonExpress(res, 429, { error: 'Rate limit exceeded (ip)', retryAfter: Math.ceil(ipRes.retryAfterMs / 1000) });
   }
-  const apiKey = req.headers['x-api-key'] || req.headers['X-API-KEY'];
-  if (!apiKey) {
-    return sendJson(res, 401, { error: 'Missing API key' });
-  }
-  const app = await getAppByApiKey(apiKey);
-  if (!app || app.revoked || new Date() > new Date(app.expires_at)) {
-    return sendJson(res, 401, { error: 'Invalid or expired API key' });
-  }
-  try {
-    const params = url.searchParams;
-    const userId = params.get('userId');
-    if (!userId) {
-      return sendJson(res, 400, { error: 'Missing userId parameter' });
+
+  if (apiKey) {
+    const keyKey = tbKeyForApiKey(apiKey);
+    const keyRes = (tokenBucketScriptSha ? await consumeTokenBucketRedis(keyKey, ANALYTICS_BUCKET_CAPACITY, ANALYTICS_BUCKET_WINDOW_MS, 1) : consumeTokenBucketFallback(keyKey, ANALYTICS_BUCKET_CAPACITY, ANALYTICS_BUCKET_WINDOW_MS, 1));
+    if (!keyRes.ok) {
+      res.setHeader('Retry-After', String(Math.ceil(keyRes.retryAfterMs / 1000)));
+      res.setHeader('X-RateLimit-Limit', String(keyRes.limit));
+      res.setHeader('X-RateLimit-Remaining', String(keyRes.remaining));
+      return sendJsonExpress(res, 429, { error: 'Rate limit exceeded (api key)', retryAfter: Math.ceil(keyRes.retryAfterMs / 1000) });
     }
+    res.setHeader('X-RateLimit-Limit', String(keyRes.limit));
+    res.setHeader('X-RateLimit-Remaining', String(keyRes.remaining));
+  } else {
+    res.setHeader('X-RateLimit-Limit', String(ipRes.limit));
+    res.setHeader('X-RateLimit-Remaining', String(ipRes.remaining));
+  }
+
+  if (!apiKey) return sendJsonExpress(res, 401, { error: 'Missing API key' });
+
+  const appRow = await requireValidApp(apiKey);
+  if (!appRow) return sendJsonExpress(res, 401, { error: 'Invalid or expired API key' });
+
+  try {
+    const userId = req.query.userId;
+    if (!userId) return sendJsonExpress(res, 400, { error: 'Missing userId parameter' });
 
     const q = `
       SELECT id, event_type, url, referrer, device, ip_address, timestamp, metadata, user_id
@@ -376,12 +647,9 @@ async function handleUserStats(req, res, url, ip) {
       WHERE app_id = $1 AND (user_id = $2 OR ip_address = $2)
       ORDER BY timestamp ASC;
     `;
-    const r = await pgClient.query(q, [app.id, userId]);
+    const r = await pgClient.query(q, [appRow.id, userId]);
     const rows = r.rows;
-
-    if (rows.length === 0) {
-      return sendJson(res, 404, { error: 'No events found for user' });
-    }
+    if (rows.length === 0) return sendJsonExpress(res, 404, { error: 'No events found for user' });
 
     const totalEvents = rows.length;
     const lastEvent = rows[rows.length - 1];
@@ -399,73 +667,27 @@ async function handleUserStats(req, res, url, ip) {
         metadata: ev.metadata,
       })),
     };
-    return sendJson(res, 200, response);
+    return sendJsonExpress(res, 200, response);
   } catch (err) {
     console.error('handleUserStats error:', err);
-    return sendJson(res, 500, { error: err.message });
+    return sendJsonExpress(res, 500, { error: err.message });
   }
-}
+});
 
-// Main request handler
-async function requestHandler(req, res) {
-  const ip = req.socket.remoteAddress || 'unknown';
-  // Parse URL
-  const url = new URL(req.url, 'http://localhost');
-  const method = req.method;
-  const pathname = url.pathname;
+// Health & docs endpoints
+app.get('/healthz', (req, res) => res.json({ ok: true }));
+// /docs could be static Swagger UI — omitted here; serve via /openapi.json + static page if desired
 
-  // CORS support for testing and cross-origin calls
-  if (method === 'OPTIONS') {
-    res.writeHead(204, {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type,X-API-KEY,x-api-key',
-      'Access-Control-Max-Age': '86400',
-    });
-    return res.end();
-  }
+// Fallback 404
+app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 
-  // Set CORS headers on all responses
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,X-API-KEY,x-api-key');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-
-  try {
-    // Routing
-    if (method === 'POST' && pathname === '/api/auth/register') {
-      return handleRegister(req, res);
-    }
-    if (method === 'GET' && pathname === '/api/auth/api-key') {
-      return handleGetApiKey(req, res, url);
-    }
-    if (method === 'POST' && pathname === '/api/auth/revoke') {
-      return handleRevoke(req, res);
-    }
-    if (method === 'POST' && pathname === '/api/analytics/collect') {
-      return handleCollect(req, res, ip);
-    }
-    if (method === 'GET' && pathname === '/api/analytics/event-summary') {
-      return handleEventSummary(req, res, url, ip);
-    }
-    if (method === 'GET' && pathname === '/api/analytics/user-stats') {
-      return handleUserStats(req, res, url, ip);
-    }
-    return sendJson(res, 404, { error: 'Not found' });
-  } catch (err) {
-    console.error('requestHandler error:', err);
-    return sendJson(res, 500, { error: 'Internal server error', details: err.message });
-  }
-}
-
-// Create the HTTP server
+// -------------------------
+// Start server helper
+// -------------------------
 function createServer() {
-  return http.createServer((req, res) => {
-    // requestHandler returns a promise; errors inside are handled
-    requestHandler(req, res);
-  });
+  return http.createServer(app);
 }
 
-// Only start the server automatically if this file is run directly
 if (require.main === module) {
   const port = process.env.PORT || 3002;
   const server = createServer();
@@ -474,5 +696,12 @@ if (require.main === module) {
   });
 }
 
-// Export server creator, pg client and init promise for tests / external control
-module.exports = {createServer,pgClient,initDbPromise,};
+// Exports
+module.exports = {
+  app,
+  createServer,
+  pgClient,
+  initDbPromise,
+  redisClient,
+  initRedisPromise,
+};
