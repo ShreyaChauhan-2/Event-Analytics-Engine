@@ -1,4 +1,4 @@
-# Event-Analytics-Engine API
+# Website Analytics API
 
 This project implements a **simple yet extensible backend API** for collecting analytics events from websites and mobile applications.
 It provides endpoints for:
